@@ -1,0 +1,22 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Cairn working artifacts
+*.db
+*.db-wal
+*.db-shm
+/store/
+/fixtures/
+/restored/
+
+.pytest_cache/
+.vscode/
+.idea/
+/realstore/
+real.db*
+
+Claude.md

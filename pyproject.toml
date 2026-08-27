@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cairn"
+version = "0.1.0"
+description = "Find the documents you forgot you had, and keep the ones that matter."
+requires-python = ">=3.12"
+# Runtime is stdlib-only by design: sqlite3, hashlib, os, argparse, unicodedata, zipfile.
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "reportlab>=4.0",
+    "python-docx>=1.1",
+]
+
+[project.scripts]
+cairn = "cairn.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
