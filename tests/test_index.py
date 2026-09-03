@@ -173,3 +173,77 @@ def test_dry_run_writes_nothing(cairn, corpus: Path):
     r = cairn.backup(all=True, dry_run=True)
     assert r.considered > 0
     assert cairn.store.object_count() == 0
+
+
+def test_changed_file_clears_its_stored_digest(cairn, tmp_path):
+    """A digest describes specific bytes; when they change it must not survive.
+
+    Regression, found deploying to a real server: regenerated PDF/DOCX fixtures
+    kept the digest of their previous contents, so `push` announced an old hash
+    while uploading new bytes. Only the server's re-hash check caught it (409).
+    Text fixtures hid the bug because they regenerate byte-identically.
+    """
+    root = tmp_path / "docs"
+    root.mkdir()
+    doc = root / "statement.txt"
+    doc.write_text("original content", encoding="utf-8")
+
+    cairn.scan([root])
+    cairn.backup(all=True)
+    stored = cairn.conn.execute("SELECT sha256 FROM files").fetchone()["sha256"]
+    assert stored, "backup should record a digest"
+
+    doc.write_text("completely different content now", encoding="utf-8")
+    cairn.scan([root])
+
+    after = cairn.conn.execute("SELECT sha256 FROM files").fetchone()["sha256"]
+    assert after is None, "a stale digest survived a content change"
+
+
+def test_unchanged_file_keeps_its_digest(cairn, tmp_path):
+    """The counterpart: re-scanning must not throw away still-valid work."""
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "statement.txt").write_text("stable content", encoding="utf-8")
+
+    cairn.scan([root])
+    cairn.backup(all=True)
+    before = cairn.conn.execute("SELECT sha256 FROM files").fetchone()["sha256"]
+
+    cairn.scan([root])
+    after = cairn.conn.execute("SELECT sha256 FROM files").fetchone()["sha256"]
+    assert after == before
+
+
+def test_v1_index_migrates_forward(tmp_path):
+    """An existing index must upgrade in place, not refuse to open."""
+    import sqlite3
+    from cairn import db as dbmod
+    from cairn.api import Cairn
+
+    path = tmp_path / "old.db"
+    c = Cairn(db_path=path, store_path=tmp_path / "store")
+    c.conn.execute("INSERT INTO files (path, path_key, name, size, mtime_ns, state, "
+                   "first_seen_ts, last_scan_ts) VALUES ('/x/a.txt','/x/a.txt','a.txt',1,1,'indexed',0,0)")
+    c.conn.execute("UPDATE meta SET value='1' WHERE key='schema_version'")
+    c.conn.execute("DROP TABLE remote_state")
+    c.close()
+
+    reopened = dbmod.connect(path)
+    assert reopened.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "2"
+    assert reopened.execute("SELECT 1 FROM sqlite_master WHERE name='remote_state'").fetchone()
+    assert reopened.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 1, "rows must survive"
+
+
+def test_index_from_a_newer_build_is_refused(tmp_path):
+    """Writing to a schema we do not understand is worse than failing."""
+    from cairn import db as dbmod
+    from cairn.api import Cairn
+
+    path = tmp_path / "future.db"
+    c = Cairn(db_path=path, store_path=tmp_path / "store")
+    c.conn.execute("UPDATE meta SET value='99' WHERE key='schema_version'")
+    c.close()
+
+    with pytest.raises(RuntimeError, match="only understands"):
+        dbmod.connect(path)

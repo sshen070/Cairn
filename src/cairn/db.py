@@ -18,7 +18,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -70,6 +70,24 @@ CREATE TABLE IF NOT EXISTS backups (
 CREATE INDEX IF NOT EXISTS idx_backups_file ON backups(file_id);
 CREATE INDEX IF NOT EXISTS idx_backups_sha  ON backups(sha256);
 
+-- What a remote server has confirmed it holds for this file.
+--
+-- Cached deliberately: the common question is "what of mine is not backed up?",
+-- and that should be answerable with the server asleep or the tunnel closed.
+-- The digest is stored alongside, which is what keeps the cache honest -- a row
+-- only counts as backed up while `remote_state.sha256` still equals the file's
+-- current `files.sha256`. Edit the file and the claim expires on its own,
+-- rather than reporting stale coverage.
+CREATE TABLE IF NOT EXISTS remote_state (
+    file_id   INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    remote    TEXT    NOT NULL,
+    sha256    TEXT    NOT NULL,
+    pushed_ts INTEGER NOT NULL,
+    PRIMARY KEY (file_id, remote)
+);
+
+CREATE INDEX IF NOT EXISTS idx_remote_state_sha ON remote_state(sha256);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS search USING fts5(name, path, body);
 """
 
@@ -86,17 +104,38 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA)
 
-    row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
-    if row is None:
-        conn.execute(
-            "INSERT INTO meta(key, value) VALUES ('schema_version', ?)",
-            (str(SCHEMA_VERSION),),
-        )
-    elif int(row["value"]) != SCHEMA_VERSION:
-        raise RuntimeError(
-            f"index at {db_path} is schema v{row['value']}, this build expects v{SCHEMA_VERSION}"
-        )
+    _migrate(conn, db_path)
     return conn
+
+
+def _migrate(conn: sqlite3.Connection, db_path: Path) -> None:
+    """Bring an existing index up to the current schema version.
+
+    Every table above is `IF NOT EXISTS`, so running the schema script has
+    already added anything new. Migration is therefore mostly about refusing to
+    open an index from a *newer* build, which would otherwise be written to with
+    the wrong assumptions.
+    """
+    row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+
+    if row is None:
+        conn.execute("INSERT INTO meta(key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
+        return
+
+    found = int(row["value"])
+    if found == SCHEMA_VERSION:
+        return
+
+    if found > SCHEMA_VERSION:
+        raise RuntimeError(
+            f"index at {db_path} is schema v{found}, but this build only understands "
+            f"v{SCHEMA_VERSION}. Upgrade cairn rather than downgrading the index."
+        )
+
+    # v1 -> v2 added `remote_state`, which the schema script above just created.
+    # Nothing to backfill: an empty cache correctly reports "not known to be
+    # backed up", and the first `cairn remote diff --refresh` fills it in.
+    conn.execute("UPDATE meta SET value = ? WHERE key = 'schema_version'", (str(SCHEMA_VERSION),))
 
 
 def fts_quote(query: str) -> str:

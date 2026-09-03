@@ -17,7 +17,7 @@ mistake means "catalogued but not copied" — never "lost".
 
 ---
 
-## Status: Phase 1 complete
+## Status: Phases 1 and 4 complete
 
 The thin vertical slice runs end to end:
 
@@ -30,8 +30,11 @@ bytes are identical. That restore test was written before any of the code it
 exercises and runs first in CI.
 
 Not yet built: PDF/OCR text extraction (Phase 2), chunking and dedup at
-sub-file granularity (Phase 3), networking (Phase 4), a trained classifier
-(Phase 5), storage budgets (Phase 6), review UI (Phase 7).
+sub-file granularity (Phase 3), a trained classifier (Phase 5), storage budgets
+(Phase 6), review UI (Phase 7).
+
+Phase 4 runs and is tested end to end over real HTTP, but **has not been deployed
+to the Pi yet** — SSH key auth from the dev machine is not set up.
 
 ---
 
@@ -160,6 +163,73 @@ stored.
 **Case and Unicode identity.** `path_key` folds case on Windows only — on Linux
 `a.txt` and `A.txt` are two files and must stay two rows. Every path is
 NFC-normalized so the same name cannot enter the index twice.
+
+---
+
+## Phase 4 — agent and server
+
+The agent and the server are now separate programs. The server holds the object
+store plus an aggregated catalogue across devices; the agent keeps its own local
+index and pushes both bytes and metadata upstream.
+
+```bash
+# on the server (a Raspberry Pi 5 here)
+bash deploy/pi-setup.sh          # installs, writes a systemd unit, prints the secret
+
+# on the client
+ssh -N -L 8823:127.0.0.1:8823 user@192.168.0.222
+cairn remote enroll --url http://127.0.0.1:8823 --name win-desktop --secret <secret>
+cairn scan ./fixtures
+cairn push --all
+cairn find tax --all-devices
+cairn pull --path ./fixtures/tax/2023_Form_1040.pdf --to ./pulled
+```
+
+**The server binds to loopback on purpose.** Behind an SSH tunnel that bind *is*
+the access control: the only way to reach the socket is to already be
+authenticated to the host. The device token identifies which device is calling;
+the tunnel authenticates the channel. When mTLS lands, the client certificate
+subject replaces the token lookup and nothing else changes.
+
+Why HTTP rather than plain SSH transport: the server is a *query* service, not a
+blob sink. "Which of these 400 digests do you already have?" is one round trip;
+over SSH it would be a process spawn per query or a hand-rolled RPC inside an SSH
+channel. Per-device authorization is also row-level policy, which a Unix account
+cannot express — and Phase 6's cloud backend and Phase 7's web UI both speak HTTP
+already.
+
+### Three properties with tests behind them
+
+**Uploads are re-hashed server-side.** The URL claims a digest; the server hashes
+the bytes that actually arrive and returns 409 on a mismatch. Storing bytes under
+the wrong name poisons a content-addressed store permanently — every later dedup
+hit returns wrong content, and `verify` cannot detect it because it compares
+against the same wrong name.
+
+**Knowing a digest is not authorization to read it.** Downloads are checked
+against `object_refs` scoped to visible devices. Refusals return 404, not 403, so
+the response cannot be used to probe which digests other devices hold.
+
+**Dedup must not cost ownership.** This one was a real bug, caught by running the
+two-device demo rather than by a test. When the server already held identical
+bytes, the second device's push skipped the transfer *and* never claimed a
+reference — so the push reported success while leaving that device unable to
+retrieve its own file. Silent false success is the worst failure mode a tool like
+this has. Fixed with an explicit `/objects/claim`, and pinned by a regression test.
+
+### Measured, two devices against one server
+
+```
+win-desktop  push --all    36 uploaded,  4 already present   170.9 KB sent
+win-desktop  push --all     0 uploaded, 40 already present     0 B sent   (100% skipped)
+pi-agent     push --all     0 uploaded,  2 already present     0 B sent   (cross-device dedup)
+pi-agent     pull                        byte-for-byte identical
+pi-agent     find tax --all-devices      no matches           (isolation holds)
+win-desktop  find tax --all-devices      3 hits from win-desktop
+```
+
+The second push moving zero bytes is resumability and deduplication being the
+same mechanism: ask what the server has, send only the difference.
 
 ---
 
